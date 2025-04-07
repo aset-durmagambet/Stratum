@@ -89,9 +89,11 @@ class StratumHandler(socketserver.BaseRequestHandler):
                             elif "method" in msg and msg["method"] == "mining.submit":
                                 logger.info(f"[SHARE] От ASIC: {line}")
                                 self.server.proxy.total_jobs_completed += 1
-                                logger.info("[ACCEPTED] ASIC отправил решение по заданию")
+                                # Отправка решения в пул
                                 self.server.proxy.pool_socket.sendall((line + "\n").encode("utf-8"))
-                                self.server.proxy.total_shares_sent_to_pool += 1  # Увеличиваем счетчик отправленных шаров
+                                # Увеличиваем счетчик отправленных шаров
+                                self.server.proxy.total_shares_sent_to_pool += 1  
+                                logger.info("[ACCEPTED] ASIC отправил решение по заданию")
                         except json.JSONDecodeError:
                             logger.debug(f"Неверный JSON от Antminer S19: {line}")
             except Exception as e:

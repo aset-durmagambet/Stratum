@@ -91,6 +91,7 @@ class StratumHandler(socketserver.BaseRequestHandler):
                                 self.server.proxy.total_jobs_completed += 1
                                 logger.info("[ACCEPTED] ASIC отправил решение по заданию")
                                 self.server.proxy.pool_socket.sendall((line + "\n").encode("utf-8"))
+                                self.server.proxy.total_shares_sent_to_pool += 1  # Увеличиваем счетчик отправленных шаров
                         except json.JSONDecodeError:
                             logger.debug(f"Неверный JSON от Antminer S19: {line}")
             except Exception as e:
@@ -103,6 +104,15 @@ class StratumHandler(socketserver.BaseRequestHandler):
             if not self.request:
                 logger.warning("[SEND JOB] Подключение к ASIC отсутствует!")
                 return
+
+            job_id = job['params'][0]
+            extranonce2 = job['params'][1]
+
+            # Отправляем задание только если оно действительно новое и ASIC его запросил
+            if job_id == self.server.proxy.last_job_id and extranonce2 == self.server.proxy.last_extranonce2:
+                logger.info("[NO CHANGE] Задание не изменилось, не отправляем его")
+                return
+
             logger.debug(f"Отправка задания в Antminer: {job}")
 
             # Логируем перед отправкой задания
@@ -112,6 +122,8 @@ class StratumHandler(socketserver.BaseRequestHandler):
                 self.server.proxy.total_jobs_sent += 1
                 logger.info("[OK] Задание отправлено в Antminer")
 
+            self.server.proxy.last_job_id = job_id
+            self.server.proxy.last_extranonce2 = extranonce2
             self.request.sendall((json.dumps(job) + "\n").encode("utf-8"))
             time.sleep(0.1)
         except Exception as e:
@@ -128,20 +140,30 @@ class StratumProxy:
         self.job_params = {}
         self.last_prevhash = None
         self.delayed_jobs = deque(maxlen=100)
-        self.total_shares_accepted = 0
-        self.total_shares_rejected = 0
-        self.total_jobs_sent = 0
-        self.total_jobs_completed = 0
+
+        # Новые счетчики
+        self.total_shares_accepted = 0  # Количество принятых шаров пулом
+        self.total_shares_rejected = 0  # Количество отклоненных шаров пулом
+        self.total_jobs_sent = 0  # Количество отправленных заданий
+        self.total_jobs_completed = 0  # Количество завершенных заданий
+        self.total_shares_sent_to_pool = 0  # Количество отправленных шаров в пул
+
+        # Новые переменные для отслеживания последнего задания
+        self.last_job_id = None
+        self.last_extranonce2 = None
+
         threading.Thread(target=self.print_stats, daemon=True).start()
 
     def print_stats(self):
         while True:
             logger.info("\n======= СТАТИСТИКА =======\n"
                         f"  Отправлено заданий  : {self.total_jobs_sent}\n"
-                        f"  Принято шар         : {self.total_shares_accepted}\n"
-                        f"  Отклонено шар       : {self.total_shares_rejected}\n"
-                        f"  Принято заданий     : {self.total_jobs_completed}\n"
-                        f"  Отложено заданий    : {len(self.delayed_jobs)}\n"
+                        f"  Принято шар от ASIC : {self.total_shares_accepted}\n"
+                        f"  Отправлено шаров на пул : {self.total_shares_sent_to_pool}\n"
+                        f"  Принято шар пулом    : {self.total_shares_accepted}\n"
+                        f"  Отклонено шар пулом  : {self.total_shares_rejected}\n"
+                        f"  Принято заданий      : {self.total_jobs_completed}\n"
+                        f"  Отложено заданий     : {len(self.delayed_jobs)}\n"
                         "==========================")
             time.sleep(60)
 
