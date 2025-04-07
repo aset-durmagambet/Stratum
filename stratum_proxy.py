@@ -104,11 +104,14 @@ class StratumHandler(socketserver.BaseRequestHandler):
                 logger.warning("[SEND JOB] Подключение к ASIC отсутствует!")
                 return
             logger.debug(f"Отправка задания в Antminer: {job}")
+
+            # Логируем перед отправкой задания
             if "method" in job and job["method"] == "mining.notify":
                 job["params"][1] = self.server.proxy.last_prevhash
                 logger.info(f"[SEND TO ASIC]\n  job_id       = {job['params'][0]}\n  extranonce2  = {self.server.proxy.extranonce2}")
                 self.server.proxy.total_jobs_sent += 1
                 logger.info("[OK] Задание отправлено в Antminer")
+
             self.request.sendall((json.dumps(job) + "\n").encode("utf-8"))
             time.sleep(0.1)
         except Exception as e:
