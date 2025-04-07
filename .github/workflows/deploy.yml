@@ -1,0 +1,30 @@
+name: Deploy to VPS
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    name: Deploy via SSH
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/github_ci
+          chmod 600 ~/.ssh/github_ci
+          ssh-keyscan -H 172.236.130.176 >> ~/.ssh/known_hosts
+
+      - name: Deploy to VPS
+        run: |
+          ssh -i ~/.ssh/github_ci root@172.236.130.176 << 'EOF'
+            cd ~/Stratum
+            git pull origin main
+            systemctl restart stratum.service || echo "🛠 Перезапуск вручную"
+          EOF
