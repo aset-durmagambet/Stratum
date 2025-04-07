@@ -1,236 +1,265 @@
-import asyncio  # Импорт библиотеки для асинхронного программирования
-import json  # Импорт библиотеки для работы с JSON (чтение/запись настроек)
-import logging  # Импорт библиотеки для логирования сообщений
-from typing import List, Dict  # Импорт типов для аннотаций (список и словарь)
-from datetime import datetime, timedelta  # Импорт классов для работы с датой и временем
-import hashlib  # Импорт библиотеки для вычисления хешей (SHA-256)
-import binascii  # Импорт библиотеки для преобразования данных в/из шестнадцатеричного формата
-import os  # Импорт библиотеки для работы с операционной системой (чтение файлов)
+import socket
+import json
+import threading
+import time
+import hashlib
+import binascii
+import numpy as np
+from queue import Queue
+import logging
+import socketserver
+from collections import deque
 
-# Загрузка конфигурации из файла
-CONFIG_FILE = "config.json"  # Имя файла конфигурации
+# Настройки логирования
+logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
+logger = logging.getLogger(__name__)
 
-def load_config(file_path: str) -> dict:  # Функция для загрузки конфигурации из файла
-    try:  # Попытка выполнить блок кода
-        with open(file_path, 'r') as f:  # Открытие файла config.json для чтения
-            config = json.load(f)  # Чтение и преобразование JSON в словарь Python
-        return config  # Возврат словаря с настройками
-    except FileNotFoundError:  # Обработка ошибки, если файл не найден
-        logging.error(f"Config file {file_path} not found. Using defaults.")  # Логирование ошибки
-        return {}  # Возврат пустого словаря (будут использованы значения по умолчанию)
-    except json.JSONDecodeError:  # Обработка ошибки, если JSON некорректен
-        logging.error(f"Invalid JSON in {file_path}. Using defaults.")  # Логирование ошибки
-        return {}  # Возврат пустого словаря
+# Настройки пула и ASIC
+POOL_HOST = "stratum.braiins.com"
+POOL_PORT = 3333
+POOL_WORKER = "AssetDurmagambet.worker1"
+POOL_PASSWORD = "x"
+ASIC_PROXY_HOST = "0.0.0.0"
+ASIC_PROXY_PORT = 3333
 
-# Установка конфигурации
-config = load_config(CONFIG_FILE)  # Загрузка настроек из файла config.json
+class StratumHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        ip, port = self.client_address
+        logger.info(f"Antminer S19 подключен с IP {ip}:{port}")
+        self.server.proxy.asic_client = self
+        last_seen = time.time()
 
-# Константы с значениями по умолчанию из конфигурации
-ASIC_IP = config.get("asic_ip", "192.168.1.10")  # IP-адрес ASIC, по умолчанию "192.168.1.10"
-PROXY_IP = config.get("proxy_ip", "192.168.1.100")  # IP-адрес прокси, по умолчанию "192.168.1.100"
-PROXY_PORT = config.get("proxy_port", 8888)  # Порт прокси, по умолчанию 8888
-POOL_IP = config.get("pool_ip", "203.0.113.5")  # IP-адрес пула, по умолчанию "203.0.113.5"
-POOL_PORT = config.get("pool_port", 3333)  # Порт пула, по умолчанию 3333
-SHARE_LOG_INTERVAL = config.get("share_log_interval", 600)  # Интервал логирования шар (в секундах), по умолчанию 600
-EXTRANONCE2_VARIANTS = config.get("extranonce2_variants", 10)  # Количество вариантов extranonce2, по умолчанию 10
-WORKER_NAME = config.get("worker_name", "worker1")  # Имя воркера для пула, по умолчанию "worker1"
-WORKER_PASSWORD = config.get("worker_password", "password")  # Пароль воркера, по умолчанию "password"
+        def monitor_asic():
+            while True:
+                time.sleep(10)
+                if time.time() - last_seen > 60:
+                    logger.warning("Antminer неактивен более 60 секунд")
+                    break
+        threading.Thread(target=monitor_asic, daemon=True).start()
 
-# Настройка логирования
-log_level = getattr(logging, config.get("log_level", "INFO").upper(), logging.INFO)  # Уровень логирования из конфига (INFO по умолчанию)
-logging.basicConfig(level=log_level, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')  # Настройка формата логов
-logger = logging.getLogger("StratumProxy")  # Создание логгера с именем "StratumProxy"
+        while self.server.proxy.delayed_jobs:
+            job = self.server.proxy.delayed_jobs.popleft()
+            logger.info("Отправка отложенного задания в Antminer")
+            self.send_job(job)
 
-class StratumProxy:  # Определение класса StratumProxy
-    def __init__(self):  # Инициализация экземпляра класса
-        self.pool_writer = None  # Переменная для записи данных в пул (будет установлена позже)
-        self.pool_reader = None  # Переменная для чтения данных из пула (будет установлена позже)
-        self.jobs: List[Dict] = []  # Список заданий для майнинга
-        self.current_difficulty = 0  # Текущая сложность майнинга
-        self.share_count = 0  # Счетчик отправленных шар
-        self.last_job_time = None  # Время последнего отправленного задания
-        self.asic_writer = None  # Переменная для записи данных в ASIC (будет установлена позже)
-        self.extranonce1 = None  # Первая часть extranonce от пула
-        self.extranonce2_size = 4  # Размер второй части extranonce (по умолчанию 4 байта)
-        self.running = True  # Флаг для управления работой прокси (True = работает)
+        if self.server.proxy.job_params:
+            try:
+                diff_msg = {
+                    "id": None,
+                    "method": "mining.set_difficulty",
+                    "params": [8192]
+                }
+                self.send_job(diff_msg)
 
-    def calculate_merkle_root(self, coinbase: str, merkle_branch: List[str], extranonce2: str) -> str:  # Вычисление корня Меркла
-        coinbase_bytes = binascii.unhexlify(coinbase) + binascii.unhexlify(self.extranonce1) + binascii.unhexlify(extranonce2)  # Сборка coinbase из строк в байты
-        coinbase_hash = hashlib.sha256(hashlib.sha256(coinbase_bytes).digest()).digest()  # Двойное хеширование coinbase
-        merkle_root = coinbase_hash  # Начальное значение корня Меркла
-        for branch in merkle_branch:  # Цикл по ветвям Меркла
-            merkle_root = hashlib.sha256(hashlib.sha256(merkle_root + binascii.unhexlify(branch)).digest()).digest()  # Обновление корня с каждой ветвью
-        return merkle_root.hex()  # Возврат корня в шестнадцатеричном формате
+                set_extranonce_msg = {
+                    "id": None,
+                    "method": "mining.set_extranonce",
+                    "params": [self.server.proxy.extranonce1, 4]
+                }
+                self.send_job(set_extranonce_msg)
+            except Exception as e:
+                logger.error(f"Ошибка при первичной инициализации ASIC: {e}")
 
-    def calculate_block_hash(self, version: str, prevhash: str, merkle_root: str, ntime: str, nbits: str) -> bytes:  # Вычисление хеша блока
-        header = (  # Сборка заголовка блока из параметров
-            binascii.unhexlify(version) +  # Версия протокола
-            binascii.unhexlify(prevhash) +  # Хеш предыдущего блока
-            binascii.unhexlify(merkle_root) +  # Корень Меркла
-            binASIC.unhexlify(ntime) +  # Время
-            binascii.unhexlify(nbits) +  # Сложность
-            b'\x00\x00\x00\x00'  # Паддинг (nonce, будет добавлен ASIC)
-        )
-        return hashlib.sha256(hashlib.sha256(header).digest()).digest()  # Двойное хеширование заголовка
+        buffer = ""
+        while True:
+            try:
+                data = self.request.recv(8192).decode("utf-8")
+                if not data:
+                    logger.debug("Antminer S19 отключен")
+                    break
+                last_seen = time.time()
+                buffer += data
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    line = line.strip()
+                    if line:
+                        logger.debug(f"Получено от Antminer S19: {line}")
+                        try:
+                            msg = json.loads(line)
+                            if "method" in msg and msg["method"] == "mining.subscribe":
+                                response = {
+                                    "id": msg["id"],
+                                    "result": [["mining.notify", "ae6812eb4cd7735a"], self.server.proxy.extranonce1, 4],
+                                    "error": None
+                                }
+                                self.request.sendall((json.dumps(response) + "\n").encode("utf-8"))
+                            elif "method" in msg and msg["method"] == "mining.authorize":
+                                response = {"id": msg["id"], "result": True, "error": None}
+                                self.request.sendall((json.dumps(response) + "\n").encode("utf-8"))
+                            elif "method" in msg and msg["method"] == "mining.submit":
+                                logger.info(f"[SHARE] От ASIC: {line}")
+                                self.server.proxy.total_jobs_completed += 1
+                                logger.info("[ACCEPTED] ASIC отправил решение по заданию")
+                                self.server.proxy.pool_socket.sendall((line + "\n").encode("utf-8"))
+                        except json.JSONDecodeError:
+                            logger.debug(f"Неверный JSON от Antminer S19: {line}")
+            except Exception as e:
+                logger.error(f"Ошибка связи с Antminer: {e}")
+                break
+        self.server.proxy.asic_client = None
 
-    def nbits_to_target(self, nbits: str) -> int:  # Преобразование nbits в целевое значение сложности
-        exponent = int(nbits[:2], 16)  # Извлечение экспоненты из первых двух символов nbits
-        coefficient = int(nbits[2:], 16)  # Извлечение коэффициента из оставшихся символов
-        return coefficient * (2 ** (8 * (exponent - 3)))  # Вычисление целевого значения
+    def send_job(self, job):
+        try:
+            if not self.request:
+                logger.warning("[SEND JOB] Подключение к ASIC отсутствует!")
+                return
+            logger.debug(f"Отправка задания в Antminer: {job}")
+            if "method" in job and job["method"] == "mining.notify":
+                job["params"][1] = self.server.proxy.last_prevhash
+                logger.info(f"[SEND TO ASIC]\n  job_id       = {job['params'][0]}\n  extranonce2  = {self.server.proxy.extranonce2}")
+                self.server.proxy.total_jobs_sent += 1
+                logger.info("[OK] Задание отправлено в Antminer")
+            self.request.sendall((json.dumps(job) + "\n").encode("utf-8"))
+            time.sleep(0.1)
+        except Exception as e:
+            logger.error(f"Ошибка отправки задания на Antminer: {e}")
 
-    async def filter_jobs(self, job: Dict) -> List[Dict]:  # Фильтрация заданий для майнинга
-        params = job["params"]  # Извлечение параметров задания
-        job_id, prevhash, coinb1, coinb2, merkle_branch, version, nbits, ntime = params[:8]  # Разбор параметров
-        coinbase = coinb1 + coinb2  # Сборка coinbase из двух частей
-        target = self.nbits_to_target(nbits)  # Вычисление целевого значения сложности
 
-        filtered_jobs = []  # Список отфильтрованных заданий
-        for i in range(EXTRANONCE2_VARIANTS):  # Цикл по количеству вариантов extranonce2
-            extranonce2 = (i * 2).to_bytes(self.extranonce2_size, byteorder='little').hex()  # Генерация extranonce2
-            merkle_root = self.calculate_merkle_root(coinbase, merkle_branch, extranonce2)  # Вычисление корня Меркла
-            block_hash = self.calculate_block_hash(version, prevhash, merkle_root, ntime, nbits)  # Вычисление хеша блока
-            block_hash_int = int.from_bytes(block_hash, byteorder='little')  # Преобразование хеша в целое число
+class StratumProxy:
+    def __init__(self):
+        self.pool_socket = None
+        self.extranonce1 = "00000000"
+        self.extranonce2 = "00000000"
+        self.asic_client = None
+        self.running = True
+        self.job_params = {}
+        self.last_prevhash = None
+        self.delayed_jobs = deque(maxlen=100)
+        self.total_shares_accepted = 0
+        self.total_shares_rejected = 0
+        self.total_jobs_sent = 0
+        self.total_jobs_completed = 0
+        threading.Thread(target=self.print_stats, daemon=True).start()
 
-            if block_hash_int < target:  # Проверка, удовлетворяет ли хеш сложности
-                filtered_job = job.copy()  # Копирование задания
-                filtered_job["extranonce2"] = extranonce2  # Добавление extranonce2
-                filtered_jobs.append(filtered_job)  # Добавление задания в список
-                logger.debug(f"Job variant accepted: job_id={job_id}, extranonce2={extranonce2}")  # Логирование принятого варианта
-        return filtered_jobs  # Возврат списка отфильтрованных заданий
+    def print_stats(self):
+        while True:
+            logger.info("\n======= СТАТИСТИКА =======\n"
+                        f"  Отправлено заданий  : {self.total_jobs_sent}\n"
+                        f"  Принято шар         : {self.total_shares_accepted}\n"
+                        f"  Отклонено шар       : {self.total_shares_rejected}\n"
+                        f"  Принято заданий     : {self.total_jobs_completed}\n"
+                        f"  Отложено заданий    : {len(self.delayed_jobs)}\n"
+                        "==========================")
+            time.sleep(60)
 
-    async def connect_to_pool(self):  # Подключение к пулу майнинга
-        while self.running:  # Цикл работает, пока прокси активен
-            try:  # Попытка подключения
-                logger.info(f"Connecting to pool at {POOL_IP}:{POOL_PORT}")  # Логирование попытки подключения
-                self.pool_reader, self.pool_writer = await asyncio.open_connection(POOL_IP, POOL_PORT)  # Открытие соединения с пулом
-                subscribe_msg = json.dumps({"id": 1, "method": "mining.subscribe", "params": []}) + "\n"  # Сообщение подписки
-                self.pool_writer.write(subscribe_msg.encode())  # Отправка подписки пулу
-                await self.pool_writer.drain()  # Ожидание завершения отправки
-                auth_msg = json.dumps({"id": 2, "method": "mining.authorize", "params": [WORKER_NAME, WORKER_PASSWORD]}) + "\n"  # Сообщение авторизации
-                self.pool_writer.write(auth_msg.encode())  # Отправка авторизации
-                await self.pool_writer.drain()  # Ожидание завершения отправки
-                break  # Выход из цикла при успешном подключении
-            except Exception as e:  # Обработка ошибок подключения
-                logger.error(f"Pool connection failed: {e}. Reconnecting in 5 seconds...")  # Логирование ошибки
-                await asyncio.sleep(5)  # Ожидание перед повторной попыткой
+    def calculate_merkle_root(self, coinb1, coinb2, extranonce1, extranonce2, merkle_branch):
+        coinbase = binascii.unhexlify(coinb1) + binascii.unhexlify(extranonce1) + binascii.unhexlify(extranonce2) + binascii.unhexlify(coinb2)
+        coinbase_hash = hashlib.sha256(hashlib.sha256(coinbase).digest()).digest()
+        current_hash = coinbase_hash
+        for branch in merkle_branch:
+            current_hash = hashlib.sha256(hashlib.sha256(current_hash + binascii.unhexlify(branch)).digest()).digest()
+        return current_hash.hex()
 
-    async def log_shares_periodically(self):  # Периодическое логирование количества шар
-        while self.running:  # Цикл работает, пока прокси активен
-            await asyncio.sleep(SHARE_LOG_INTERVAL)  # Ожидание заданного интервала
-            logger.info(f"Shares submitted in last {SHARE_LOG_INTERVAL//60} minutes: {self.share_count}")  # Логирование количества шар
-            self.share_count = 0  # Сброс счетчика шар
+    def handle_pool_message(self, message):
+        try:
+            data = json.loads(message)
+            logger.debug(f"Обработка сообщения от пула: {data}")
 
-    async def handle_pool_messages(self):  # Обработка сообщений от пула
-        while self.running:  # Цикл работает, пока прокси активен
-            try:  # Попытка обработки сообщений
-                line = await self.pool_reader.readline()  # Чтение строки из пула
-                if not line:  # Если строка пустая (соединение разорвано)
-                    logger.warning("Pool connection closed.")  # Логирование разрыва
-                    break  # Выход из цикла
-                msg = json.loads(line.decode().strip())  # Преобразование строки в JSON
-                logger.debug(f"Received from pool: {msg}")  # Логирование полученного сообщения
+            if data.get("id") == 1 and "result" in data:
+                self.extranonce1 = data["result"][1]
+                logger.info(f"Получен extranonce1 от пула: {self.extranonce1}")
 
-                if msg.get("method") == "mining.set_difficulty":  # Если пул устанавливает сложность
-                    self.current_difficulty = msg["params"][0]  # Обновление текущей сложности
-                    logger.info(f"Set difficulty: {self.current_difficulty}")  # Логирование новой сложности
+            elif data.get("id") == 2 and "result" in data:
+                logger.info("Авторизация на пуле прошла успешно." if data["result"] else "Авторизация не удалась")
 
-                elif msg.get("result") and isinstance(msg["result"], list):  # Если это ответ на подписку
-                    self.extranonce1 = msg["result"][1]  # Сохранение extranonce1
-                    self.extranonce2_size = int(msg["result"][2])  # Сохранение размера extranonce2
+            elif data.get("method") == "mining.notify":
+                params = data.get("params", [])
+                if len(params) >= 9:
+                    job_id, prevhash, coinb1, coinb2, merkle_branch, version, nbits, ntime, clean_jobs = params
+                    self.last_prevhash = prevhash
+                    self.job_params = {"version": version, "nbits": nbits, "ntime": ntime}
+                    merkle_root = self.calculate_merkle_root(coinb1, coinb2, self.extranonce1, self.extranonce2, merkle_branch)
+                    logger.info(f"Обнаружен новый merkle root: {merkle_root}")
 
-                elif msg.get("method") == "mining.notify":  # Если пул отправил новое задание
-                    self.jobs.clear()  # Очистка текущего списка заданий
-                    filtered_jobs = await self.filter_jobs(msg)  # Фильтрация заданий
-                    self.jobs.extend(filtered_jobs)  # Добавление отфильтрованных заданий в список
-                    logger.info(f"New job queue created with {len(self.jobs)} variants")  # Логирование количества заданий
+                    valid = []
+                    for i in range(1000):
+                        en2 = f"{i:08x}"
+                        root = self.calculate_merkle_root(coinb1, coinb2, self.extranonce1, en2, merkle_branch)
+                        total = sum(int.from_bytes(binascii.unhexlify(root)[i:i+4], 'big') for i in range(0, 16, 4))
+                        if total < 2**31.95:
+                            valid.append((en2, total))
+                    valid.sort(key=lambda x: x[1])
+                    self.extranonce2 = valid[0][0] if valid else "00000000"
+                    logger.info("Фильтрация завершена — топ:\n" + "\n".join([f"  - {v[0]} -> вес: {v[1]}" for v in valid[:5]]))
 
-                    if self.asic_writer and self.jobs and self.last_job_time is None:  # Если есть ASIC и задания
-                        self.last_job_time = datetime.now()  # Установка времени последнего задания
-                        first_job = self.jobs.pop(0)  # Извлечение первого задания
-                        self.asic_writer.write(json.dumps(first_job).encode() + b"\n")  # Отправка задания ASIC
-                        await self.asic_writer.drain()  # Ожидание завершения отправки
-                        logger.info(f"Sent initial job to ASIC: job_id={first_job['params'][0]}")  # Логирование отправки
-            except Exception as e:  # Обработка ошибок
-                logger.error(f"Error in pool messages: {e}")  # Логирование ошибки
-                break  # Выход из цикла при ошибке
+                    notify = {
+                        "id": None,
+                        "method": "mining.notify",
+                        "params": [job_id, prevhash, coinb1, coinb2, merkle_branch, version, nbits, ntime, clean_jobs]
+                    }
 
-    async def handle_asic(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):  # Обработка подключения ASIC
-        self.asic_writer = writer  # Сохранение объекта для записи в ASIC
-        addr = writer.get_extra_info("peername")  # Получение адреса ASIC
-        logger.info(f"ASIC connected from {addr}")  # Логирование подключения
+                    if self.asic_client:
+                        logger.info("[DISPATCH] Отправка задания в ASIC")
+                        self.asic_client.send_job(notify)
+                    else:
+                        logger.info("[QUEUE] ASIC не подключён — задание в очередь")
+                        self.delayed_jobs.append(notify)
 
-        try:  # Попытка обработки сообщений от ASIC
-            while self.running:  # Цикл работает, пока прокси активен
-                line = await reader.readline()  # Чтение строки от ASIC
-                if not line:  # Если строка пустая (соединение разорвано)
-                    break  # Выход из цикла
-                msg = json.loads(line.decode().strip())  # Преобразование строки в JSON
-                logger.debug(f"Received from ASIC: {msg}")  # Логирование полученного сообщения
+            elif data.get("id") and "result" in data:
+                share_result = data["result"]
+                if share_result is True:
+                    self.total_shares_accepted += 1
+                    logger.info(f"[SHARE ACCEPTED] id={data['id']}, total={self.total_shares_accepted}")
+                else:
+                    self.total_shares_rejected += 1
+                    logger.warning(f"[SHARE REJECTED] id={data['id']}, rejected={self.total_shares_rejected}")
 
-                if msg.get("method") in ["mining.subscribe", "mining.authorize"]:  # Если это подписка или авторизация
-                    self.pool_writer.write(line)  # Пересылка сообщения пулу
-                    await self.pool_writer.drain()  # Ожидание завершения отправки
+        except Exception as e:
+            logger.error(f"Ошибка при обработке сообщения от пула: {e}")
 
-                elif msg.get("method") == "mining.submit":  # Если ASIC отправил решение (шару)
-                    self.pool_writer.write(line)  # Пересылка шары пулу
-                    await self.pool_writer.drain()  # Ожидание завершения отправки
-                    self.share_count += 1  # Увеличение счетчика шар
-                    logger.info(f"Share submitted: {self.share_count} total")  # Логирование отправки шары
+    def listen_to_pool(self):
+        buffer = b""
+        while self.running:
+            try:
+                chunk = self.pool_socket.recv(8192)
+                if not chunk:
+                    break
+                buffer += chunk
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    self.handle_pool_message(line.decode("utf-8").strip())
+            except Exception as e:
+                logger.error(f"Ошибка при получении данных от пула: {e}")
+                break
 
-                    if self.last_job_time and (datetime.now() - self.last_job_time).seconds >= SHARE_LOG_INTERVAL:  # Если прошло достаточно времени
-                        if self.jobs:  # Если есть задания в очереди
-                            next_job = self.jobs.pop(0)  # Извлечение следующего задания
-                            writer.write(json.dumps(next_job).encode() + b"\n")  # Отправка задания ASIC
-                            await writer.drain()  # Ожидание завершения отправки
-                            logger.info(f"Sent job to ASIC after interval: job_id={next_job['params'][0]}")  # Логирование отправки
-                            self.last_job_time = datetime.now()  # Обновление времени последнего задания
-        except Exception as e:  # Обработка ошибок
-            logger.error(f"ASIC handling error: {e}")  # Логирование ошибки
-        finally:  # Выполняется всегда при завершении
-            writer.close()  # Закрытие соединения с ASIC
-            await writer.wait_closed()  # Ожидание завершения закрытия
-            logger.info(f"ASIC connection closed from {addr}")  # Логирование разрыва
+    def connect_to_pool(self):
+        while self.running:
+            try:
+                logger.info("Подключение к пулу...")
+                self.pool_socket = socket.create_connection((POOL_HOST, POOL_PORT))
+                logger.info("Подключено к пулу")
 
-    async def handle_input(self):  # Обработка ввода с клавиатуры
-        loop = asyncio.get_running_loop()  # Получение текущего цикла событий
-        while self.running:  # Цикл работает, пока прокси активен
-            try:  # Попытка чтения ввода
-                command = await loop.run_in_executor(None, input, "Enter command (stop to exit): ")  # Чтение команды из консоли
-                if command.lower() == "stop":  # Если введена команда "stop"
-                    self.running = False  # Остановка прокси
-                    logger.info("Stopping proxy...")  # Логирование остановки
-            except Exception as e:  # Обработка ошибок ввода
-                logger.error(f"Input error: {e}")  # Логирование ошибки
+                subscribe_request = json.dumps({"id": 1, "method": "mining.subscribe", "params": ["bmminer/1.0.0"]}) + "\n"
+                self.pool_socket.sendall(subscribe_request.encode("utf-8"))
 
-    async def start(self):  # Запуск прокси-сервера
-        try:  # Попытка запуска
-            await self.connect_to_pool()  # Подключение к пулу
-            asyncio.create_task(self.handle_pool_messages())  # Запуск задачи обработки сообщений от пула
-            asyncio.create_task(self.log_shares_periodically())  # Запуск задачи логирования шар
-            asyncio.create_task(self.handle_input())  # Запуск задачи обработки ввода
+                auth_request = json.dumps({"id": 2, "method": "mining.authorize", "params": [POOL_WORKER, POOL_PASSWORD]}) + "\n"
+                self.pool_socket.sendall(auth_request.encode("utf-8"))
 
-            server = await asyncio.start_server(self.handle_asic, PROXY_IP, PROXY_PORT)  # Создание сервера для ASIC
-            logger.info(f"Proxy started at {PROXY_IP}:{PROXY_PORT}")  # Логирование запуска сервера
-            async with server:  # Автоматическое управление сервером
-                await server.serve_forever()  # Запуск сервера в бесконечном цикле
-        except Exception as e:  # Обработка ошибок запуска
-            logger.error(f"Startup error: {e}")  # Логирование ошибки
-        finally:  # Выполняется при завершении
-            if self.pool_writer:  # Если есть соединение с пулом
-                self.pool_writer.close()  # Закрытие соединения
-                await self.pool_writer.wait_closed()  # Ожидание завершения закрытия
-            logger.info("Proxy stopped.")  # Логирование остановки
+                self.listen_to_pool()
+            except Exception as e:
+                logger.error(f"Ошибка подключения к пулу: {e}")
+                time.sleep(5)
 
-if __name__ == "__main__":  # Если скрипт запущен напрямую
-    proxy = StratumProxy()  # Создание экземпляра прокси
-    asyncio.run(proxy.start())  # Запуск асинхронного выполнения прокси
+    def start(self):
+        threading.Thread(target=self.connect_to_pool, daemon=True).start()
 
-# Общий комментарий о работе программы:
-# Этот код реализует асинхронный прокси-сервер для протокола Stratum, используемого в майнинге криптовалют.
-# Он выступает посредником между ASIC-устройством (майнером) и пулом майнинга. Основные функции:
-# 1. Загружает настройки из файла config.json (IP-адреса, порты, имя воркера и т.д.).
-# 2. Подключается к пулу майнинга, подписывается и авторизуется.
-# 3. Принимает задания от пула, фильтрует их (проверяет варианты extranonce2 на соответствие сложности) и отправляет подходящие задания ASIC.
-# 4. Пересылает решения (шары) от ASIC пулу и ведет их подсчет.
-# 5. Логирует работу (соединения, ошибки, шары) и позволяет остановить прокси через команду "stop".
-# Программа устойчива к сбоям (переподключается к пулу при разрыве) и использует асинхронность для одновременной обработки подключений.
+def start_asic_server(proxy):
+    try:
+        server = socketserver.ThreadingTCPServer((ASIC_PROXY_HOST, ASIC_PROXY_PORT), StratumHandler)
+        server.proxy = proxy
+        ip, port = server.server_address
+        logger.info(f"Сервер для Antminer S19 запущен на {ip}:{port}")
+        server.serve_forever()
+    except Exception as e:
+        logger.critical(f"Ошибка запуска сервера для ASIC: {e}")
+
+if __name__ == "__main__":
+    proxy = StratumProxy()
+    threading.Thread(target=start_asic_server, args=(proxy,), daemon=True).start()
+    proxy.start()
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        logger.info("Завершение по Ctrl+C")
