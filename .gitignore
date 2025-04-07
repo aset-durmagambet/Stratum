@@ -1,0 +1,38 @@
+# 🔐 Секреты
+*.key
+*.pem
+*.env
+token_Git.txt
+
+# 🗂 Конфигурации и временные файлы
+*.log
+*.bak
+*.tmp
+*.rtf
+*.docx
+*.pptx
+*.url
+*.bmp
+New Text Document.txt
+
+# 💻 IDE/Editor файлы
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 💾 Jupyter
+.ipynb_checkpoints/
+__pycache__/
+*.ipynb
+
+# 🧪 Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ⚙️ OS системные
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,0 +1,12 @@
+{
+  "asic_ip": "192.168.1.10",
+  "proxy_ip": "192.168.1.100",
+  "proxy_port": 8888,
+  "pool_ip": "203.0.113.5",
+  "pool_port": 3333,
+  "share_log_interval": 600,
+  "extranonce2_variants": 10,
+  "worker_name": "worker1",
+  "worker_password": "password",
+  "log_level": "INFO"
+}
