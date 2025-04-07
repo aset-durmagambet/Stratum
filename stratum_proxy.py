@@ -104,6 +104,15 @@ class StratumHandler(socketserver.BaseRequestHandler):
             if not self.request:
                 logger.warning("[SEND JOB] Подключение к ASIC отсутствует!")
                 return
+
+            job_id = job['params'][0]
+            extranonce2 = job['params'][1]
+
+            # Отправляем задание только если оно действительно новое и ASIC его запросил
+            if job_id == self.server.proxy.last_job_id and extranonce2 == self.server.proxy.last_extranonce2:
+                logger.info("[NO CHANGE] Задание не изменилось, не отправляем его")
+                return
+
             logger.debug(f"Отправка задания в Antminer: {job}")
 
             # Логируем перед отправкой задания
@@ -113,6 +122,8 @@ class StratumHandler(socketserver.BaseRequestHandler):
                 self.server.proxy.total_jobs_sent += 1
                 logger.info("[OK] Задание отправлено в Antminer")
 
+            self.server.proxy.last_job_id = job_id
+            self.server.proxy.last_extranonce2 = extranonce2
             self.request.sendall((json.dumps(job) + "\n").encode("utf-8"))
             time.sleep(0.1)
         except Exception as e:
@@ -136,6 +147,10 @@ class StratumProxy:
         self.total_jobs_sent = 0  # Количество отправленных заданий
         self.total_jobs_completed = 0  # Количество завершенных заданий
         self.total_shares_sent_to_pool = 0  # Количество отправленных шаров в пул
+
+        # Новые переменные для отслеживания последнего задания
+        self.last_job_id = None
+        self.last_extranonce2 = None
 
         threading.Thread(target=self.print_stats, daemon=True).start()
 
