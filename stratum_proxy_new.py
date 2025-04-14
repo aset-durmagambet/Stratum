@@ -1,4 +1,4 @@
-
+import socket
 import json
 import threading
 import time
@@ -21,6 +21,7 @@ POOL_WORKER = "AssetDurmagambet.worker1"
 POOL_PASSWORD = "x"
 ASIC_PROXY_HOST = "0.0.0.0"
 ASIC_PROXY_PORT = 3333
+
 class StratumHandler(socketserver.BaseRequestHandler):
     def handle(self):
         ip, port = self.client_address
@@ -75,7 +76,6 @@ class StratumHandler(socketserver.BaseRequestHandler):
                         logger.debug(f"Получено от Antminer S19: {line}")
                         try:
                             msg = json.loads(line)
-
                             if "method" in msg and msg["method"] == "mining.subscribe":
                                 response = {
                                     "id": msg["id"],
@@ -83,47 +83,23 @@ class StratumHandler(socketserver.BaseRequestHandler):
                                     "error": None
                                 }
                                 self.request.sendall((json.dumps(response) + "\n").encode("utf-8"))
-
                             elif "method" in msg and msg["method"] == "mining.authorize":
                                 response = {"id": msg["id"], "result": True, "error": None}
                                 self.request.sendall((json.dumps(response) + "\n").encode("utf-8"))
-
-                            elif "method" in msg and msg["method"] == "mining.configure":
-                                response = {
-                                    "id": msg["id"],
-                                    "result": {
-                                        "version-rolling": True,
-                                        "version-rolling.mask": "1fffe000"
-                                    },
-                                    "error": None
-                                }
-                                self.request.sendall((json.dumps(response) + "\n").encode("utf-8"))
-                                logger.debug("[CONFIGURE] Ответил на mining.configure")
-
-                                version_mask_msg = {
-                                    "id": 1,
-                                    "method": "mining.set_version_mask",
-                                    "params": ["1fffe000"]
-                                }
-                                self.request.sendall((json.dumps(version_mask_msg) + "\n").encode("utf-8"))
-                                logger.debug("[CONFIGURE] Отправил mining.set_version_mask")
-
                             elif "method" in msg and msg["method"] == "mining.submit":
                                 logger.info(f"[SHARE] От ASIC: {line}")
                                 self.server.proxy.total_jobs_completed += 1
+                                # Отправка решения в пул
                                 self.server.proxy.pool_socket.sendall((line + "\n").encode("utf-8"))
-                                self.server.proxy.total_shares_sent_to_pool += 1
+                                # Увеличиваем счетчик отправленных шаров
+                                self.server.proxy.total_shares_sent_to_pool += 1  
                                 logger.info("[ACCEPTED] ASIC отправил решение по заданию")
-
                         except json.JSONDecodeError:
                             logger.debug(f"Неверный JSON от Antminer S19: {line}")
-
             except Exception as e:
                 logger.error(f"Ошибка связи с Antminer: {e}")
                 break
-
         self.server.proxy.asic_client = None
-
 
     def send_job(self, job):
         try:
@@ -134,8 +110,9 @@ class StratumHandler(socketserver.BaseRequestHandler):
             if job["method"] != "mining.notify":
                 logger.warning("[SEND JOB] Неподдерживаемый тип задания")
                 return
+
             params = job["params"]
-            job_id = str(params[0])  # обязательно строка для Bitmain
+            job_id = params[0]
             prevhash = params[1]
             coinb1 = params[2]
             coinb2 = params[3]

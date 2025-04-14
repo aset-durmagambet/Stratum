@@ -1,0 +1,602 @@
+import asyncio
+import socket
+socket.setdefaulttimeout(60)
+import threading
+import json
+import hashlib
+import binascii
+import logging
+from logging.handlers import RotatingFileHandler
+import time
+import sqlite3
+import os
+import signal
+import sys
+import psutil
+import requests
+from aiohttp import web
+from socketserver import ThreadingMixIn, TCPServer, StreamRequestHandler
+from threading import Lock
+import aiohttp
+
+# Конфигурация пула
+POOL_HOST = os.getenv("POOL_HOST", "165.22.46.160")
+POOL_PORT = int(os.getenv("POOL_PORT", 3333))
+
+# Конфигурация прокси для ASIC
+ASIC_PROXY_HOST = os.getenv("ASIC_PROXY_HOST", "0.0.0.0")
+ASIC_PROXY_PORT = int(os.getenv("ASIC_PROXY_PORT", 3333))
+
+# Путь к базе данных
+DB_PATH = os.getenv("DB_PATH", "asic_proxy.db")
+
+# Версия приложения
+VERSION = "1.0.0"
+
+# Конфигурация Telegram
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "7207281851:AAEzDaJmpvA6KB9xgTo7dnEbnW4LUtnH4FQ")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "480223056")
+
+# Инициализация логгера
+logger = logging.getLogger("ASICProxy")
+logger.setLevel(logging.INFO)
+handler = RotatingFileHandler("asic_proxy.log", maxBytes=10*1024*1024, backupCount=5)
+formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+
+# Глобальные переменные для fix_hex_string
+last_hex_warning_time = 0
+hex_warning_shown = False
+
+# Глобальные переменные для управления завершением
+shutdown_event = asyncio.Event()
+
+# Обработка сигналов для graceful shutdown
+def handle_shutdown(signum, frame):
+    logger.info("Получен сигнал завершения (Ctrl+C или SIGTERM), останавливаем сервер...")
+    shutdown_event.set()
+    if 'server' in globals():
+        server.shutdown()
+    if 'proxy' in globals():
+        proxy.stop()
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, handle_shutdown)
+signal.signal(signal.SIGINT, handle_shutdown)
+
+async def ensure_port_available(port: int):
+    """Освобождает указанный порт, завершая процессы, которые его используют."""
+    logger.info(f"[PORT] Проверка порта {port}...")
+    processed_pids = set()
+    port_in_use_initial = any(p.laddr.port == port for p in psutil.net_connections(kind='inet'))
+    if not port_in_use_initial:
+        logger.info(f"[PORT] Порт {port} уже свободен.")
+        return
+    for conn in psutil.net_connections(kind='inet'):
+        if conn.laddr.port == port and conn.pid not in processed_pids:
+            try:
+                proc = psutil.Process(conn.pid)
+                logger.info(f"[PORT IN USE] Убиваем процесс PID={conn.pid}, использующий порт :{port}")
+                proc.terminate()
+                try:
+                    proc.wait(timeout=10)
+                except psutil.TimeoutExpired:
+                    logger.warning(f"[PORT] Процесс PID={conn.pid} не завершился, принудительно убиваем...")
+                    proc.kill()
+                processed_pids.add(conn.pid)
+                await asyncio.sleep(2)
+            except Exception as e:
+                logger.error(f"Ошибка при завершении процесса: {e}")
+    timeout = 60
+    start_time = time.time()
+    while True:
+        if time.time() - start_time > timeout:
+            logger.error(f"[PORT] Не удалось освободить порт {port} за {timeout} секунд")
+            raise RuntimeError(f"Не удалось освободить порт {port}")
+        port_in_use = any(p.laddr.port == port for p in psutil.net_connections(kind='inet'))
+        if not port_in_use:
+            logger.info(f"[PORT] Порт {port} освободился.")
+            break
+        await asyncio.sleep(1)
+
+class TelegramHandler(logging.Handler):
+    """Асинхронный обработчик логов для отправки в Telegram с поддержкой команд."""
+    def __init__(self, token, chat_id, loop=None):
+        super().__init__()
+        self.token = token
+        self.chat_id = chat_id
+        self.url = f"https://api.telegram.org/bot{token}/sendMessage"
+        self.enabled = True
+        self.shutdown_flag = False
+        self.loop = loop or asyncio.get_event_loop()
+
+    async def send_message(self, message):
+        """Асинхронная отправка сообщения в Telegram."""
+        async with aiohttp.ClientSession() as session:
+            payload = {
+                "chat_id": self.chat_id,
+                "text": message,
+                "parse_mode": "HTML"
+            }
+            try:
+                async with session.post(self.url, data=payload, timeout=10) as resp:
+                    await resp.text()
+            except Exception as e:
+                logger.error(f"[TelegramHandler] Ошибка при отправке в Telegram: {e}")
+
+    def emit(self, record):
+        """Отправка логов в Telegram."""
+        if self.shutdown_flag or not self.enabled:
+            return
+        try:
+            log_entry = self.format(record)
+            keywords = ["submit", "notify", "asic", "pool", "share", "error"]
+            if any(keyword in log_entry.lower() for keyword in keywords):
+                message = f"🚨 <b>{record.levelname}</b>\n<code>{log_entry}</code>"
+                asyncio.run_coroutine_threadsafe(self.send_message(message), self.loop)
+            # Проверка на команду /shutdown
+            if "/shutdown" in log_entry.lower():
+                asyncio.run_coroutine_threadsafe(self.handle_shutdown(), self.loop)
+        except Exception as e:
+            logger.error(f"[TelegramHandler] Ошибка в emit: {e}")
+
+    async def handle_shutdown(self):
+        """Обработка команды /shutdown."""
+        await self.send_message("🛑 Выполняется завершение работы по команде /shutdown...")
+        logger.info("[TELEGRAM] Получена команда /shutdown, завершаем работу...")
+        self.disable()
+        shutdown_event.set()  # Устанавливаем событие завершения
+        if 'proxy' in globals():
+            proxy.stop()
+        if 'server' in globals():
+            server.shutdown()
+
+    def disable(self):
+        self.shutdown_flag = True
+        self.enabled = False
+
+    def enable(self):
+        self.enabled = True
+        self.shutdown_flag = False
+
+class ThreadedTCPServer(ThreadingMixIn, TCPServer):
+    allow_reuse_address = True
+
+class ASICHandler(StreamRequestHandler):
+    """Обработчик подключений от ASIC-устройств."""
+    def handle(self):
+        logger.info(f"[ASIC] Подключение от {self.client_address[0]}")
+        self.server.asic_socket = self.request
+        while True:
+            try:
+                data = self.request.recv(4096).decode('utf-8')
+                if data:
+                    logger.info(f"[ASIC DATA] Получено от ASIC: {data}")
+                    try:
+                        msg = json.loads(data)
+                        if msg.get("method") == "mining.configure":
+                            response = {
+                                "id": msg["id"],
+                                "result": {"version-rolling": True},
+                                "error": None
+                            }
+                            self.request.sendall((json.dumps(response) + '\n').encode('utf-8'))
+                            logger.info(f"[ASIC] Отправлен ответ на mining.configure: {response}")
+                        elif msg.get("method") == "mining.subscribe":
+                            while not (hasattr(self.server, 'proxy') and self.server.proxy.extranonce1 is not None and self.server.proxy.extranonce2_size):
+                                time.sleep(1)
+                            response = {
+                                "id": msg["id"],
+                                "result": [["mining.notify", "ae6812eb4cd7735a"]],
+                                "extranonce1": self.server.proxy.extranonce1,
+                                "extranonce2_size": self.server.proxy.extranonce2_size
+                            }
+                            self.request.sendall((json.dumps(response) + '\n').encode('utf-8'))
+                            logger.info(f"[ASIC] Отправлен ответ на mining.subscribe: {response}")
+                            auth_msg = {
+                                "id": msg["id"] + 1,
+                                "method": "mining.authorize",
+                                "params": ["worker", "x"]
+                            }
+                            self.server.proxy._send_to_pool(auth_msg)
+                            self.request.sendall((json.dumps(auth_msg) + '\n').encode('utf-8'))
+                            logger.info(f"[ASIC] Отправлен mining.authorize: {auth_msg}")
+                        elif msg.get("method") == "mining.authorize":
+                            if hasattr(self.server, 'proxy'):
+                                self.server.proxy._send_to_pool(msg)
+                                response = {"id": msg["id"], "result": True, "error": None}
+                                self.request.sendall((json.dumps(response) + '\n').encode('utf-8'))
+                                logger.info(f"[ASIC] Отправлен ответ на mining.authorize: {response}")
+                                self.server.proxy.authorized = True
+                        elif msg.get("method") == "mining.submit" and hasattr(self.server, 'proxy'):
+                            self.server.proxy._send_to_pool(msg)
+                            logger.info(f"[ASIC] Шара получена и добавлена в очередь для пула: {msg}")
+                        elif hasattr(self.server, 'proxy'):
+                            self.server.proxy._send_to_pool(msg)
+                    except json.JSONDecodeError:
+                        logger.error(f"[ASIC DATA] Некорректный JSON от ASIC: {data}")
+                else:
+                    logger.warning("[ASIC] Соединение с ASIC разорвано")
+                    break
+            except Exception as e:
+                logger.error(f"[ASIC] Ошибка чтения данных от ASIC: {e}")
+                break
+
+class PoolConnector(Thread):
+    """Соединитель с майнинг-пулом с поддержкой очередей для пула и ASIC."""
+    def __init__(self, server):
+        super().__init__(daemon=True)
+        self.server = server
+        self.asic_socket = None
+        self.pool_socket = None
+        self.extranonce1 = None
+        self.extranonce2_size = 0
+        self.job_id = None
+        self.difficulty = None
+        self.authorized = False
+        self.jobs = {}
+        self.accepted_shares = 0
+        self.rejected_shares = 0
+        self.db_lock = Lock()
+        self.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        self.cur = self.conn.cursor()
+        self._init_db()
+        self.pool_queue = asyncio.Queue()
+        self.asic_queue = asyncio.Queue()
+        self.running = True
+        self.loop = asyncio.new_event_loop()
+
+    def _init_db(self):
+        with self.db_lock:
+            self.cur.execute("""
+                CREATE TABLE IF NOT EXISTS submits (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    extranonce2 TEXT,
+                    timestamp INTEGER
+                )
+            """)
+            self.conn.commit()
+
+    def run(self):
+        asyncio.set_event_loop(self.loop)
+        try:
+            self.loop.run_until_complete(self._run_async())
+        finally:
+            self._cleanup_loop()
+
+    def _cleanup_loop(self):
+        """Очистка асинхронного цикла."""
+        for task in asyncio.all_tasks(self.loop):
+            task.cancel()
+        self.loop.run_until_complete(self.loop.shutdown_asyncgens())
+        self.loop.close()
+
+    async def _run_async(self):
+        while self.running and not shutdown_event.is_set():
+            try:
+                logger.info(f"[POOL] Попытка подключения к пулу {POOL_HOST}:{POOL_PORT}...")
+                with socket.create_connection((POOL_HOST, POOL_PORT)) as s:
+                    self.pool_socket = s
+                    logger.info(f"[POOL] Подключение к {POOL_HOST}:{POOL_PORT} успешно")
+                    self._subscribe()
+                    await asyncio.gather(
+                        self._read_pool_messages(),
+                        self._process_pool_queue(),
+                        self._process_asic_queue()
+                    )
+            except Exception as e:
+                logger.error(f"[POOL] Ошибка в соединении с пулом: {e}")
+                self.pool_socket = None
+                await asyncio.sleep(5)
+            if shutdown_event.is_set():
+                break
+
+    async def _read_pool_messages(self):
+        while self.running and self.pool_socket and not shutdown_event.is_set():
+            try:
+                self.pool_socket.settimeout(30.0)
+                buffer = ""
+                while True:
+                    chunk = self.pool_socket.recv(4096).decode('utf-8')
+                    if not chunk:
+                        break
+                    buffer += chunk
+                    if buffer.count('{') == buffer.count('}') and buffer.endswith('\n'):
+                        break
+                if buffer:
+                    for message in self._split_messages(buffer):
+                        try:
+                            self._handle_pool_message(json.loads(message))
+                        except Exception as e:
+                            logger.error(f"Ошибка обработки сообщения от пула: {e}\n{message}")
+                else:
+                    logger.warning("[POOL] Соединение с пулом разорвано")
+                    break
+            except socket.timeout:
+                logger.warning("[RECV] Таймаут получения данных от пула")
+                continue
+            except Exception as e:
+                logger.error(f"[RECV] Ошибка получения данных: {e}")
+                break
+        self.pool_socket = None
+
+    async def _process_pool_queue(self):
+        while self.running and not shutdown_event.is_set():
+            try:
+                if self.pool_queue.qsize() > 100:
+                    logger.warning("[POOL QUEUE] Очередь переполнена, возможна потеря сообщений")
+                msg = await self.pool_queue.get()
+                if not self.pool_socket or self.pool_socket.fileno() == -1:
+                    logger.warning("[POOL] Соединение с пулом потеряно, переподключаемся...")
+                    self.pool_queue.put_nowait(msg)
+                    break
+                if msg.get("method") not in ["mining.subscribe", "mining.authorize"] and not self.authorized:
+                    logger.warning("[POOL] Пропущена отправка, авторизация не завершена")
+                    self.pool_queue.put_nowait(msg)
+                    await asyncio.sleep(1)
+                    continue
+                try:
+                    message = json.dumps(msg) + '\n'
+                    self.pool_socket.sendall(message.encode('utf-8'))
+                    logger.debug(f"[POOL SEND] Отправлено в пул в {time.time()}: {msg}")
+                    await asyncio.sleep(0.1)
+                except Exception as e:
+                    logger.error(f"[POOL SEND] Ошибка отправки: {e}, переподключаемся...")
+                    self.pool_queue.put_nowait(msg)
+                    self.pool_socket = None
+                    break
+                finally:
+                    self.pool_queue.task_done()
+            except Exception as e:
+                logger.error(f"[POOL QUEUE] Ошибка обработки очереди: {e}")
+                await asyncio.sleep(1)
+
+    async def _process_asic_queue(self):
+        while self.running and not shutdown_event.is_set():
+            try:
+                if self.asic_queue.qsize() > 100:
+                    logger.warning("[ASIC QUEUE] Очередь переполнена, возможна потеря сообщений")
+                msg = await self.asic_queue.get()
+                if not self.asic_socket or self.asic_socket.fileno() == -1:
+                    logger.warning("[ASIC] ASIC-сокет недоступен, пытаемся переподключиться...")
+                    self.asic_queue.put_nowait(msg)
+                    self._reconnect_asic()
+                    await asyncio.sleep(1)
+                    continue
+                try:
+                    message = json.dumps(msg) + '\n'
+                    self.asic_socket.sendall(message.encode('utf-8'))
+                    logger.info(f"[ASIC SEND] Отправлено в ASIC в {time.time()}: {msg}")
+                    await asyncio.sleep(0.05)
+                except Exception as e:
+                    logger.error(f"[ASIC SEND] Ошибка отправки: {e}")
+                    self.asic_queue.put_nowait(msg)
+                    self._reconnect_asic()
+                finally:
+                    self.asic_queue.task_done()
+            except Exception as e:
+                logger.error(f"[ASIC QUEUE] Ошибка обработки очереди: {e}")
+                await asyncio.sleep(1)
+
+    def _split_messages(self, data):
+        return data.strip().split('\n')
+
+    def _send_to_pool(self, msg):
+        asyncio.run_coroutine_threadsafe(self.pool_queue.put(msg), self.loop)
+        logger.debug(f"[POOL QUEUE] Добавлено в очередь в {time.time()}: {msg}")
+
+    def _send_to_asic(self, msg):
+        asyncio.run_coroutine_threadsafe(self.asic_queue.put(msg), self.loop)
+        logger.info(f"[ASIC QUEUE] Добавлено в очередь в {time.time()}: {msg}")
+
+    def _reconnect_asic(self):
+        logger.warning("[RECONNECT] Попытка переподключения к ASIC...")
+        try:
+            if self.asic_socket and self.asic_socket.fileno() != -1:
+                self.asic_socket.close()
+            self.asic_socket = None
+            while not self.asic_socket and self.running and not shutdown_event.is_set():
+                if hasattr(self.server, 'asic_socket') and self.server.asic_socket.fileno() != -1:
+                    self.asic_socket = self.server.asic_socket
+                    logger.info("[RECONNECT] Успешное переподключение к ASIC")
+                    break
+                time.sleep(1)
+        except Exception as e:
+            logger.error(f"[RECONNECT] Ошибка при переподключении к ASIC: {e}")
+
+    def _subscribe(self):
+        self._send_to_pool({"id": 1, "method": "mining.subscribe", "params": []})
+        self._send_to_pool({"id": 2, "method": "mining.authorize", "params": ["worker", "x"]})
+
+    def _handle_pool_message(self, msg):
+        logger.debug(f"Сообщение от пула: {msg}")
+        if msg.get("method") == "mining.set_difficulty":
+            self.difficulty = msg['params'][0]
+            self._send_to_asic({
+                "id": None,
+                "method": "mining.set_difficulty",
+                "params": [self.difficulty]
+            })
+        elif msg.get("method") == "mining.notify" and self.authorized:
+            params = msg.get("params", [])
+            if isinstance(params, list) and len(params) >= 8:
+                self._handle_notify(params[:8])
+            else:
+                logger.error(f"Некорректный формат notify: {params}")
+        elif msg.get("result") and isinstance(msg['result'], list):
+            self.extranonce1 = msg['result'][1]
+            self.extranonce2_size = msg['result'][2]
+            logger.info(f"[EXTRANONCE1] Получен: {self.extranonce1}, размер: {self.extranonce2_size}")
+        elif msg.get("id") == 2 and msg.get("result") is True:
+            self.authorized = True
+            logger.info("[POOL] Авторизация в пуле успешна")
+        elif "id" in msg and "method" not in msg and not isinstance(msg.get("result"), list):
+            if msg.get("result") is True:
+                self.accepted_shares += 1
+                logger.info("[SHARE] Принята")
+            else:
+                self.rejected_shares += 1
+                logger.info(f"[SHARE] Отклонена: {msg.get('error')}")
+
+    def _handle_notify(self, params):
+        try:
+            job_id, coinb1, coinb2, merkle_branch, version, nbits, ntime, clean_jobs = params
+            logger.debug(f"[RAW NOTIFY] job_id={job_id}, coinb1={coinb1}, coinb2={coinb2}, merkle_branch={merkle_branch}")
+            coinb1 = fix_hex_string(coinb1)
+            coinb2 = fix_hex_string(coinb2)
+            extranonce2 = self._select_best_extranonce2(job_id)
+            extranonce1 = fix_hex_string(self.extranonce1) if self.extranonce1 else "00"
+            merkle_root = calculate_merkle_root(coinb1, coinb2, extranonce1, extranonce2, merkle_branch)
+            logger.info(f"[FILTERED] job_id={job_id} → best extranonce2: {extranonce2}")
+            logger.info(f"[MERKLE ROOT] job_id={job_id} → {merkle_root}")
+            logger.info(f"[SEND] Отправлено ASIC: job_id={job_id}")
+            self._send_to_asic({
+                "id": None,
+                "method": "mining.notify",
+                "params": [job_id, coinb1, coinb2, merkle_branch, version, nbits, ntime, clean_jobs]
+            })
+        except Exception as e:
+            logger.error(f"[HANDLE NOTIFY] Ошибка разбора notify: {e}")
+
+    def _select_best_extranonce2(self, job_id):
+        candidates = [f"{i:08x}" for i in range(256)]
+        weights = {}
+        for ex2 in candidates:
+            total = sum(hashlib.sha256(bytes.fromhex(ex2)).digest())
+            weights[ex2] = total % (2**32)
+        sorted_weights = sorted(weights.items(), key=lambda item: item[1])
+        top = sorted_weights[-5:]
+        for val, score in top:
+            logger.info(f"  - {val} -> вес: {score}")
+        best = top[-1][0] if top else "00000000"
+        return best
+
+    def stop(self):
+        self.running = False
+        if self.pool_socket:
+            self.pool_socket.close()
+        if self.asic_socket:
+            self.asic_socket.close()
+        self.conn.close()
+        self._cleanup_loop()
+
+def fix_hex_string(s):
+    global last_hex_warning_time, hex_warning_shown
+    current_time = time.time()
+    if len(s) % 2 != 0:
+        if not hex_warning_shown or (current_time - last_hex_warning_time >= 100):
+            logger.warning(f"[HEX FIX] Строка нечётной длины, добавляем 0: {s}")
+            last_hex_warning_time = current_time
+            hex_warning_shown = True
+        s = '0' + s
+    return s
+
+def calculate_merkle_root(coinb1, coinb2, extranonce1, extranonce2, branches):
+    coinb1 = fix_hex_string(coinb1)
+    coinb2 = fix_hex_string(coinb2)
+    extranonce1 = fix_hex_string(extranonce1)
+    extranonce2 = fix_hex_string(extranonce2)
+    branches = [fix_hex_string(b) for b in branches]
+    coinbase = coinb1 + extranonce1 + extranonce2 + coinb2
+    logger.debug(f"[COINBASE RAW] {coinbase}")
+    coinbase_bin = binascii.unhexlify(coinbase)
+    coinbase_hash = hashlib.sha256(hashlib.sha256(coinbase_bin).digest()).digest()
+    merkle_root = coinbase_hash
+    for branch in branches:
+        merkle_root = hashlib.sha256(hashlib.sha256(merkle_root + binascii.unhexlify(branch)).digest()).digest()
+    return merkle_root.hex()
+
+async def main_async():
+    global server, proxy, telegram_handler
+    logger.info("[STARTUP] Программа начала выполнение...")
+    local_server = None
+    local_proxy = None
+    local_telegram_handler = None
+    try:
+        logger.info(f"[PORT] Проверка порта {ASIC_PROXY_PORT}...")
+        await ensure_port_available(ASIC_PROXY_PORT)
+        logger.info(f"[PORT] Порт {ASIC_PROXY_PORT} доступен.")
+        logger.info(f"[SERVER] Запуск TCP-сервера на {ASIC_PROXY_HOST}:{ASIC_PROXY_PORT}...")
+        local_server = ThreadedTCPServer((ASIC_PROXY_HOST, ASIC_PROXY_PORT), ASICHandler)
+        local_proxy = PoolConnector(local_server)
+        local_server.proxy = local_proxy
+        server = local_server
+        proxy = local_proxy
+        local_proxy.start()
+        threading.Thread(target=local_server.serve_forever, daemon=True).start()
+        logger.info(f"[SERVER] Прокси-сервер запущен на {ASIC_PROXY_HOST}:{ASIC_PROXY_PORT}")
+
+        async def handle_status(request):
+            return web.json_response({
+                "version": VERSION,
+                "accepted_shares": proxy.accepted_shares,
+                "rejected_shares": proxy.rejected_shares,
+                "connected": proxy.pool_socket is not None,
+                "pool_queue_size": proxy.pool_queue.qsize(),
+                "asic_queue_size": proxy.asic_queue.qsize()
+            })
+
+        async def handle_shutdown(request):
+            if local_telegram_handler:
+                await local_telegram_handler.handle_shutdown()
+            return web.Response(text="Shutting down...")
+
+        app = web.Application()
+        app.add_routes([
+            web.get('/status', handle_status),
+            web.get('/shutdown', handle_shutdown)
+        ])
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, '0.0.0.0', 8080)
+        await site.start()
+        logger.info("[HTTP] Мониторинг доступен на порту 8080")
+
+        current_loop = asyncio.get_running_loop()
+        local_telegram_handler = TelegramHandler(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, loop=current_loop)
+        local_telegram_handler.setLevel(logging.DEBUG)
+        local_telegram_handler.setFormatter(formatter)
+        logger.addHandler(local_telegram_handler)
+        telegram_handler = local_telegram_handler
+
+        # Ожидание события завершения
+        while not shutdown_event.is_set():
+            await asyncio.sleep(1)
+    except Exception as e:
+        logger.error(f"[MAIN] Ошибка в main_async: {e}")
+        if local_proxy:
+            local_proxy.stop()
+        if local_server:
+            local_server.shutdown()
+        raise
+    finally:
+        logger.info("Закрываем ресурсы...")
+        if local_proxy:
+            local_proxy.stop()
+        if local_server:
+            local_server.shutdown()
+        if local_telegram_handler:
+            local_telegram_handler.disable()
+        await asyncio.sleep(1)  # Даем время на завершение задач
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main_async())
+    except KeyboardInterrupt:
+        logger.warning("🛑 Остановка по Ctrl+C")
+        shutdown_event.set()
+        try:
+            if 'telegram_handler' in globals():
+                telegram_handler.disable()
+            if 'proxy' in globals():
+                proxy.stop()
+            if 'server' in globals():
+                server.shutdown()
+            logger.info("[SERVER] Сервер корректно остановлен.")
+        except Exception as e:
+            logger.error(f"[ERROR] При остановке сервера: {e}")
+        sys.exit(0)
+    except Exception as e:
+        logger.error(f"[MAIN] Необработанная ошибка: {e}")
+        sys.exit(1)

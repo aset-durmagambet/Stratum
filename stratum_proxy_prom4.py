@@ -124,6 +124,12 @@ class PoolConnector(threading.Thread):
         self.jobs = {}
         self.accepted_shares = 0
         self.rejected_shares = 0
+        self.rejection_reasons = {  # Новый словарь для подсчёта причин отклонения
+            "Low difficulty share": 0,
+            "Stale share": 0,
+            "Duplicate share": 0,
+            "Unknown error": 0
+        }
         self.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         self.cur = self.conn.cursor()
         self.last_extranonce2 = None  # Для отслеживания последнего использованного extranonce2
@@ -244,7 +250,20 @@ class PoolConnector(threading.Thread):
                 logger.info("[POOL SHARE] Шара принята пулом")
             else:
                 self.rejected_shares += 1
-                logger.info(f"[POOL SHARE] Шара отклонена: {msg.get('error')}")
+                error = msg.get("error")
+                if isinstance(error, str):
+                    if "low difficulty" in error.lower():
+                        reason = "Low difficulty share"
+                    elif "stale" in error.lower():
+                        reason = "Stale share"
+                    elif "duplicate" in error.lower():
+                        reason = "Duplicate share"
+                    else:
+                        reason = "Unknown error"
+                else:
+                    reason = "Unknown error"
+                self.rejection_reasons[reason] += 1
+                logger.info(f"[POOL SHARE] Шара отклонена: {error} (Категория: {reason})")
 
     def _handle_notify(self, params):
         try:
@@ -376,4 +395,6 @@ if __name__ == '__main__':
 
     while True:
         time.sleep(100)
-        logger.info(f"[STATS] Accepted: {proxy.accepted_shares}, Rejected: {proxy.rejected_shares}")
+        rejection_stats = "; ".join(f"{reason}: {count}" for reason, count in proxy.rejection_reasons.items() if count > 0)
+        logger.info(f"[STATS] Accepted: {proxy.accepted_shares}, Rejected: {proxy.rejected_shares}"
+                    f"{f', Rejection reasons: {rejection_stats}' if rejection_stats else ''}")

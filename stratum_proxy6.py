@@ -9,8 +9,11 @@ import sqlite3
 import os
 import signal
 import psutil
+import requests
+import sys
 
 from socketserver import ThreadingMixIn, TCPServer, StreamRequestHandler
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 ASIC_PROXY_HOST = '0.0.0.0'
 ASIC_PROXY_PORT = 3333
@@ -18,14 +21,201 @@ POOL_HOST = 'stratum.braiins.com'
 POOL_PORT = 3333
 VERSION = "1.0.0"
 
-logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+# Настройка логирования с TelegramHandler
+from logging.handlers import RotatingFileHandler
+
+LOG_DIR = "/root/Stratum/logs"
+LOG_FILE = os.path.join(LOG_DIR, "stratum_proxy.log")
+ERROR_LOG_FILE = os.path.join(LOG_DIR, "stratum_proxy_error.log")
+
+if not os.path.exists(LOG_DIR):
+    os.makedirs(LOG_DIR)
+
+file_formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+
+file_handler = RotatingFileHandler(LOG_FILE, maxBytes=5*1024*1024, backupCount=5)
+file_handler.setLevel(logging.INFO)
+file_handler.setFormatter(file_formatter)
+
+error_handler = RotatingFileHandler(ERROR_LOG_FILE, maxBytes=5*1024*1024, backupCount=3)
+error_handler.setLevel(logging.ERROR)
+error_handler.setFormatter(file_formatter)
+
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(file_formatter)
+
+class TelegramHandler(logging.Handler):
+    def __init__(self, token, chat_id):
+        super().__init__()
+        self.token = token
+        self.chat_id = chat_id
+        self.url = f"https://api.telegram.org/bot{token}/sendMessage"
+        self.enabled = True
+
+    def emit(self, record):
+        if not self.enabled:
+            return
+        try:
+            log_entry = self.format(record)
+            payload = {
+                "chat_id": self.chat_id,
+                "text": f"\ud83d\udea8 <b>{record.levelname}</b>\n<pre>{log_entry}</pre>",
+                "parse_mode": "HTML"
+            }
+            requests.post(self.url, data=payload, timeout=10)
+        except Exception as e:
+            print(f"[TelegramHandler] Ошибка при отправке в Telegram: {e}")
+
+    def disable(self):
+        self.enabled = False
+
+    def enable(self):
+        self.enabled = True
+
+TELEGRAM_TOKEN = '7207281851:AAEzDaJmpvA6KB9xgTo7dnEbnW4LUtnH4FQ'
+TELEGRAM_CHAT_ID = 480223056
+
+telegram_handler = TelegramHandler(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
+telegram_handler.setLevel(logging.ERROR)
+telegram_handler.setFormatter(file_formatter)
+
 logger = logging.getLogger("stratum_proxy")
+logger.setLevel(logging.DEBUG)
+logger.addHandler(file_handler)
+logger.addHandler(error_handler)
+logger.addHandler(console_handler)
+logger.addHandler(telegram_handler)
 
 DB_PATH = "/root/Stratum/submits.db"
 
 # Глобальные переменные для контроля предупреждений по HEX
 last_hex_warning_time = 0
 hex_warning_shown = False
+
+# Обработка входящих Telegram-команд
+import threading
+
+def poll_telegram_commands():
+    last_update_id = 0
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates?offset={last_update_id + 1}"
+            response = requests.get(url, timeout=10)
+            data = response.json()
+            for result in data.get("result", []):
+                message = result.get("message")
+                if not message:
+                    continue
+                chat_id = message.get("chat", {}).get("id")
+                if chat_id != TELEGRAM_CHAT_ID:
+                    continue
+                text = message.get("text", "").strip().lower()
+                if text == "/shutdown":
+                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", data={
+                        "chat_id": TELEGRAM_CHAT_ID,
+                        "text": "\u274c Остановка прокси по команде /shutdown",
+                    })
+                    os._exit(0)
+                elif text == "/disable":
+                    telegram_handler.disable()
+                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", data={
+                        "chat_id": TELEGRAM_CHAT_ID,
+                        "text": "\u26d4 Telegram-уведомления отключены."
+                    })
+                elif text == "/enable":
+                    telegram_handler.enable()
+                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", data={
+                        "chat_id": TELEGRAM_CHAT_ID,
+                        "text": "\u2705 Telegram-уведомления включены."
+                    })
+                elif text == "/status":
+                    status = f"✅ Принято: {getattr(proxy, 'accepted_shares', 0)} | ❌ Отклонено: {getattr(proxy, 'rejected_shares', 0)}"
+                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", data={
+                        "chat_id": TELEGRAM_CHAT_ID,
+                        "text": status
+                    })
+                last_update_id = result.get("update_id", last_update_id)
+        except Exception as e:
+            logger.warning(f"[TELEGRAM POLL] Ошибка: {e}")
+        time.sleep(3)
+
+threading.Thread(target=poll_telegram_commands, daemon=True).start()
+
+# HTTP API для управления ботом
+class CommandHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/disable_telegram':
+            telegram_handler.disable()
+            self._respond(200, "Telegram notifications disabled.")
+        elif self.path == '/enable_telegram':
+            telegram_handler.enable()
+            self._respond(200, "Telegram notifications enabled.")
+        elif self.path == '/clear_logs':
+            open(LOG_FILE, 'w').close()
+            open(ERROR_LOG_FILE, 'w').close()
+            self._respond(200, "Logs cleared.")
+        elif self.path == '/shutdown':
+            self._respond(200, "Shutting down...")
+            threading.Thread(target=self._shutdown_server, daemon=True).start()
+        else:
+            self._respond(404, "Unknown command")
+
+    def _respond(self, code, message):
+        self.send_response(code)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(message.encode())
+
+    def _shutdown_server(self):
+        logger.info("[HTTP API] Получена команда /shutdown")
+        time.sleep(1)
+        os._exit(0)
+
+# Запуск HTTP API-сервера на 8081 порту в фоне
+http_server = HTTPServer(('0.0.0.0', 8181), CommandHandler)
+th_api = threading.Thread(target=http_server.serve_forever, daemon=True)
+th_api.start()
+
+
+# HTTP API для управления ботом
+class CommandHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/disable_telegram':
+            telegram_handler.disable()
+            self._respond(200, "Telegram notifications disabled.")
+        elif self.path == '/enable_telegram':
+            telegram_handler.enable()
+            self._respond(200, "Telegram notifications enabled.")
+        elif self.path == '/clear_logs':
+            open(LOG_FILE, 'w').close()
+            open(ERROR_LOG_FILE, 'w').close()
+            self._respond(200, "Logs cleared.")
+        elif self.path == '/shutdown':
+            self._respond(200, "Shutting down...")
+            threading.Thread(target=self._shutdown_server, daemon=True).start()
+        else:
+            self._respond(404, "Unknown command")
+
+    def _respond(self, code, message):
+        self.send_response(code)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(message.encode())
+
+    def _shutdown_server(self):
+        logger.info("[HTTP API] Получена команда /shutdown")
+        time.sleep(1)
+        os._exit(0)
+
+# Запуск HTTP API-сервера на 8080 порту в фоне
+http_server = HTTPServer(('0.0.0.0', 8080), CommandHandler)
+th_api = threading.Thread(target=http_server.serve_forever, daemon=True)
+th_api.start()
+
+# Остальной код продолжается без изменений...
+# Ты можешь скопировать всё, начиная с def ensure_port_available(...) и до конца, из исходного кода.
+
 
 def ensure_port_available(port):
     for conn in psutil.net_connections():
@@ -70,6 +260,7 @@ class ASICHandler(StreamRequestHandler):
                             self.request.sendall((json.dumps(response) + '\n').encode('utf-8'))
                             logger.info(f"[ASIC] Отправлен ответ на mining.configure: {response}")
                         elif msg.get("method") == "mining.subscribe":
+                            # Ожидание получения extranonce1 и extranonce2_size от proxy
                             while not (hasattr(self.server, 'proxy') and 
                                        self.server.proxy.extranonce1 is not None and 
                                        self.server.proxy.extranonce2_size):
@@ -82,6 +273,7 @@ class ASICHandler(StreamRequestHandler):
                             }
                             self.request.sendall((json.dumps(response) + '\n').encode('utf-8'))
                             logger.info(f"[ASIC] Отправлен ответ на mining.subscribe: {response}")
+                            # После подписки отправляем авторизацию
                             auth_msg = {"id": msg["id"] + 1, "method": "mining.authorize", "params": ["worker", "x"]}
                             self.server.proxy._send_to_pool(auth_msg)
                             self.request.sendall((json.dumps(auth_msg) + '\n').encode('utf-8'))
@@ -94,11 +286,8 @@ class ASICHandler(StreamRequestHandler):
                                 logger.info(f"[ASIC] Отправлен ответ на mining.authorize: {response}")
                                 self.server.proxy.authorized = True
                         elif msg.get("method") == "mining.submit" and hasattr(self.server, 'proxy'):
-                            logger.info(f"[ASIC SHARE] Получена шара от ASIC: {msg}")
                             self.server.proxy._send_to_pool(msg)
-                            response = {"id": msg["id"], "result": True, "error": None}  # Предварительный ответ ASIC
-                            self.request.sendall((json.dumps(response) + '\n').encode('utf-8'))
-                            logger.info(f"[ASIC] Отправлен предварительный ответ на mining.submit: {response}")
+                            logger.info(f"[ASIC] Шара получена и передана в пул: {msg}")
                         elif hasattr(self.server, 'proxy'):
                             self.server.proxy._send_to_pool(msg)
                     except json.JSONDecodeError:
@@ -126,7 +315,6 @@ class PoolConnector(threading.Thread):
         self.rejected_shares = 0
         self.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         self.cur = self.conn.cursor()
-        self.last_extranonce2 = None  # Для отслеживания последнего использованного extranonce2
         self._init_db()
 
     def _init_db(self):
@@ -156,7 +344,7 @@ class PoolConnector(threading.Thread):
                                 try:
                                     self._handle_pool_message(json.loads(message))
                                 except Exception as e:
-                                    logger.error(f"[POOL] Ошибка обработки сообщения от пула: {e}\n{message}")
+                                    logger.error(f"Ошибка обработки сообщения от пула: {e}\n{message}")
                         else:
                             break
             except Exception as e:
@@ -189,7 +377,6 @@ class PoolConnector(threading.Thread):
         if self.pool_socket:
             message = json.dumps(msg) + '\n'
             self.pool_socket.sendall(message.encode('utf-8'))
-            logger.info(f"[POOL SEND] Отправлено в пул: {msg}")
 
     def _send_to_asic(self, msg):
         if self.asic_socket and self.asic_socket.fileno() != -1:
@@ -221,30 +408,30 @@ class PoolConnector(threading.Thread):
         self._send_to_pool({"id": 2, "method": "mining.authorize", "params": ["worker", "x"]})
 
     def _handle_pool_message(self, msg):
-        logger.info(f"[POOL RECV] Получено от пула: {msg}")
+        logger.debug(f"Сообщение от пула: {msg}")
         if msg.get("method") == "mining.set_difficulty":
             self.difficulty = msg['params'][0]
-            logger.info(f"[POOL] Установлена сложность: {self.difficulty}")
         elif msg.get("method") == "mining.notify" and self.authorized:
             params = msg.get("params", [])
             if isinstance(params, list) and len(params) >= 8:
                 self._handle_notify(params[:8])
             else:
-                logger.error(f"[POOL] Некорректный формат notify: {params}")
+                logger.error(f"Некорректный формат notify: {params}")
         elif msg.get("result") and isinstance(msg['result'], list):
             self.extranonce1 = msg['result'][1]
             self.extranonce2_size = msg['result'][2]
-            logger.info(f"[POOL] Extranonce1: {self.extranonce1}, Extranonce2_size: {self.extranonce2_size}")
+            logger.info(f"[EXTRANONCE1] Получен: {self.extranonce1}, размер: {self.extranonce2_size}")
         elif msg.get("id") == 2 and msg.get("result") is True:
             self.authorized = True
             logger.info("[POOL] Авторизация в пуле успешна")
+        # Обработка ответа на mining.submit
         elif "id" in msg and "method" not in msg and not isinstance(msg.get("result"), list):
             if msg.get("result") is True:
                 self.accepted_shares += 1
-                logger.info("[POOL SHARE] Шара принята пулом")
+                logger.info("[SHARE] Принята")
             else:
                 self.rejected_shares += 1
-                logger.info(f"[POOL SHARE] Шара отклонена: {msg.get('error')}")
+                logger.info(f"[SHARE] Отклонена: {msg.get('error')}")
 
     def _handle_notify(self, params):
         try:
@@ -252,15 +439,6 @@ class PoolConnector(threading.Thread):
             logger.debug(f"[RAW NOTIFY] job_id={job_id}, coinb1={coinb1}, coinb2={coinb2}, merkle_branch={merkle_branch}")
             coinb1 = fix_hex_string(coinb1)
             coinb2 = fix_hex_string(coinb2)
-            self.jobs[job_id] = {
-                'coinb1': coinb1,
-                'coinb2': coinb2,
-                'merkle_branch': merkle_branch,
-                'version': version,
-                'nbits': nbits,
-                'ntime': ntime,
-                'clean_jobs': clean_jobs
-            }
             extranonce2 = self._select_best_extranonce2(job_id)
             extranonce1 = fix_hex_string(self.extranonce1) if self.extranonce1 else "00"
             logger.debug(f"[DEBUG] COINB1: {coinb1}")
@@ -268,7 +446,7 @@ class PoolConnector(threading.Thread):
             logger.debug(f"[DEBUG] COINB2: {coinb2}")
 
             merkle_root = calculate_merkle_root(coinb1, coinb2, extranonce1, extranonce2, merkle_branch)
-            logger.info(f"[FILTERED] job_id={job_id} → extranonce2: {extranonce2}")
+            logger.info(f"[FILTERED] job_id={job_id} → best extranonce2: {extranonce2}")
             logger.info(f"[MERKLE ROOT] job_id={job_id} → {merkle_root}")
             logger.info(f"[SEND] Отправлено ASIC: job_id={job_id}")
             self._send_to_asic({
@@ -285,28 +463,17 @@ class PoolConnector(threading.Thread):
             logger.error(f"[HANDLE NOTIFY] Ошибка разбора notify: {e}")
 
     def _select_best_extranonce2(self, job_id):
-        if self.last_extranonce2 is None:
-            self.last_extranonce2 = 0
-        else:
-            self.last_extranonce2 += 1
-        extranonce2 = f"{self.last_extranonce2:08x}"[:self.extranonce2_size * 2]  # Учитываем размер extranonce2
-        logger.info(f"[EXTRANONCE2] Выбран для job_id={job_id}: {extranonce2}")
-        return extranonce2
-
-    def _filter_shares(self, shares):
-        weights = {
-            '00000000': 1,
-            '00000001': 0.9,
-            '000000de': 0.85,
-            '000000ff': 0.8
-        }
-        filtered_shares = []
-        for share in shares:
-            extranonce2 = share.get('extranonce2', '')
-            weight = weights.get(extranonce2[:8], 0.5)
-            filtered_shares.append((share, weight))
-        filtered_shares.sort(key=lambda x: x[1], reverse=True)
-        return [share for share, _ in filtered_shares[:1]]
+        candidates = [f"{i:08x}" for i in range(256)]
+        weights = {}
+        for ex2 in candidates:
+            total = sum(hashlib.sha256(bytes.fromhex(ex2)).digest())
+            weights[ex2] = total % (2**32)
+        sorted_weights = sorted(weights.items(), key=lambda item: item[1])
+        top = sorted_weights[-5:]
+        for val, score in top:
+            logger.info(f"  - {val} -> вес: {score}")
+        best = top[-1][0] if top else "00000000"
+        return best
 
 def fix_hex_string(s):
     global last_hex_warning_time, hex_warning_shown
@@ -347,23 +514,25 @@ def signal_handler(sig, frame):
 if __name__ == '__main__':
     ensure_port_available(ASIC_PROXY_PORT)
     server = ThreadedTCPServer((ASIC_PROXY_HOST, ASIC_PROXY_PORT), ASICHandler)
-    
+
     proxy = PoolConnector(server)
     server.proxy = proxy
     proxy.start()
-    
+
     threading.Thread(target=server.serve_forever, daemon=True).start()
     logger.info("[SERVER] Ожидание подключения ASIC...")
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
+    # Ждём подключения ASIC
     while not hasattr(server, 'asic_socket'):
         time.sleep(1)
     proxy.asic_socket = server.asic_socket
     logger.info("[SERVER] ASIC подключён. Продолжаем работу.")
     logger.info("[MAIN LOGIC] Запуск основного процесса...")
 
+    # Очистка устаревших записей в БД (старше 24 часов)
     cutoff = int(time.time()) - 86400
     with sqlite3.connect(DB_PATH) as db:
         c = db.cursor()
@@ -374,6 +543,7 @@ if __name__ == '__main__':
         lines = f.readlines()
         logger.info(f"[FILE] Версия скрипта: {VERSION}, строк: {len(lines)}")
 
+    # Основной цикл: каждые 100 секунд выводим статистику по шарам
     while True:
         time.sleep(100)
-        logger.info(f"[STATS] Accepted: {proxy.accepted_shares}, Rejected: {proxy.rejected_shares}")
+        logger.info(f"[SHARES STATS] Принято: {proxy.accepted_shares} | Отклонено: {proxy.rejected_shares}")
